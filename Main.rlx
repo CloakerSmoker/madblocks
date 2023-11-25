@@ -1,0 +1,363 @@
+
+#Require "$/Console.rlx"
+#Require "$/AVLTree.rlx"
+#Require "$/PointerArray.rlx"
+
+#Require "Time.rlx"
+#Require "fcntl.rlx"
+
+i64 CurrentBlock := 0
+i64 TotalBlocks := 0
+
+enum DiskErrorKind {
+    Read,
+    Write,
+    Corruption
+}
+
+define i8* GetDiskErrorKindName(DiskErrorKind Kind) {
+    i8*[3] Names {"Read", "Write", "Corruption"}
+
+    return Names[Kind As i32]
+}
+
+struct ErrorRecord {
+    i64 BlockNumber
+    i64[3] ErrorCounts
+
+    define void Merge(ErrorRecord* Other) {
+        this->ErrorCounts[DiskErrorKind::Read] := Other->ErrorCounts[DiskErrorKind::Read]
+        this->ErrorCounts[DiskErrorKind::Write] := Other->ErrorCounts[DiskErrorKind::Write]
+        this->ErrorCounts[DiskErrorKind::Corruption] := Other->ErrorCounts[DiskErrorKind::Corruption]
+    }
+}
+
+struct PassInfo {
+    i64 StartTime
+    i64 EndTime
+
+    i8* Name
+    i32 Value
+
+    AVLTree* Errors
+
+    void(StorageDevice*, i64, i64) DoPass
+
+    static self* New(i8* Name, i32 Value, void(StorageDevice*, i64, i64) DoPass) {
+        self* this := Alloc(#self)
+
+        this->Name := Name
+        this->Value := Value
+        this->DoPass := DoPass
+
+        this->Errors := AVLTree:New(#ErrorRecord)
+
+        return this
+    }
+}
+
+struct StorageDevice {
+    i8* FilePath
+    i64 FileHandle
+
+    i64 OutputHandle
+
+    i64 BlockSize
+    i64 TotalBlocks
+
+    i64 BatchSize
+    void* WriteBuffer
+    void* ReadBuffer
+
+    i64 StartTime
+    i32 CurrentPassNumber
+
+    i64 MaxErrors
+
+    AVLTree* ErrorRecords
+    ErrorRecord* GlobalErrors
+    PointerArray* Passes ; <PassInfo*>
+
+    static self* New() {
+        self* this := Alloc(#self)
+
+        this->ErrorRecords := AVLTree:New(#ErrorRecord)
+        this->GlobalErrors := Alloc(#ErrorRecord)
+        this->Passes := PointerArray:New()
+
+        return this
+    }
+
+    define PassInfo* CurrentPass() {
+        return this->Passes->At(this->CurrentPassNumber)
+    }
+
+    define void AddPass(PassInfo* Info) {
+        this->Passes->Push(Info)
+    }
+}
+
+define i64 GetUnixtime() {
+    timeval val
+    GetTimeOfDay(&val)
+
+    return val.Seconds
+}
+
+define void PrintStatus(StorageDevice* Device, i64 Block) {
+    Print("%c%s: %s: ", 0xD, Device->FilePath, Device->CurrentPass()->Name)
+
+    i64 Duration := GetUnixtime() - Device->StartTime
+    
+    i64 Seconds := Duration % 60
+    Duration /= 60
+    i64 Hours := Duration / 60
+    i64 Minutes := Duration % 60
+
+    i8* SecondPadding := ""
+    i8* MinutePadding := ""
+
+    if (Seconds < 10) {
+        SecondPadding := "0"
+    }
+
+    if (Minutes < 10) {
+        MinutePadding := "0"
+    }
+
+    Print("[%i:%s%i:%s%i]", Hours, MinutePadding, Minutes, SecondPadding, Seconds)
+
+    i64 Percent := (Block * 1000) / Device->TotalBlocks
+
+    i64 Whole := Percent / 10
+    i64 Fraction := Percent % 10
+
+    Print(" %i.%i%%", Whole, Fraction)
+
+    i64 ReadErrors := Device->GlobalErrors->ErrorCounts[DiskErrorKind::Read]
+    i64 WriteErrors := Device->GlobalErrors->ErrorCounts[DiskErrorKind::Write]
+    i64 CorruptionErrors := Device->GlobalErrors->ErrorCounts[DiskErrorKind::Corruption]
+
+    Print(", %i errored blocks, %ir/%iw/%ic errors", Device->ErrorRecords->Count(), ReadErrors, WriteErrors, CorruptionErrors)
+}
+
+define void RecordBlockError(StorageDevice* Device, i64 Block, DiskErrorKind Kind) {
+    ErrorRecord* Record := Device->ErrorRecords->Get(Block)
+
+    if (Record) {
+        Record->ErrorCounts[Kind] += 1
+    }
+    else {
+        ErrorRecord NewRecord {
+            BlockNumber: Block,
+            ErrorCounts: {0, 0, 0}
+        }
+
+        NewRecord.ErrorCounts[Kind] += 1
+
+        Device->ErrorRecords->Insert(Block, &NewRecord)
+    }
+
+    i8* KindName := GetDiskErrorKindName(Kind)
+
+    Print("%s: %s: %s error on block %i (%x)\n", Device->FilePath, Device->CurrentPass()->Name, KindName, Block, Block)
+
+    Device->GlobalErrors->ErrorCounts[Kind] += 1
+}
+
+define void PopulateDeviceBuffers(StorageDevice* Device, i32 Value) {
+    FastSetMemory8(Device->ReadBuffer, Value, Device->BatchSize * Device->BlockSize)
+    FastSetMemory8(Device->WriteBuffer, Value, Device->BatchSize * Device->BlockSize)
+}
+
+define i64 WriteBlocks(StorageDevice* Device, i64 Block, i64 Count) {
+    FileSeek(Device->FileHandle, (Block * Device->BlockSize) As i32, SEEK_SET)
+    i64 Result := FileWrite(Device->FileHandle, Device->WriteBuffer, (Count * Device->BlockSize) As i32)
+
+    if (Result < 0) {
+        Result := 0
+    }
+
+    return Result / Device->BlockSize
+}
+
+define void WritePass(StorageDevice* Device, i64 StartBlock, i64 EndBlock) {
+    PassInfo* Pass := Device->CurrentPass()
+
+    PopulateDeviceBuffers(Device, Pass->Value)
+    FileSeek(Device->FileHandle, 0, SEEK_SET)
+
+    i64 Block := StartBlock
+    i64 AttemptSize := Device->BatchSize
+    i8 LastFailed := false
+
+    while (Block != EndBlock) {
+        if (Block + AttemptSize > EndBlock) {
+            AttemptSize := EndBlock - Block
+        }
+
+        i64 Written := WriteBlocks(Device, Block, AttemptSize)
+
+        if (Written = 0 && LastFailed) {
+            RecordBlockError(Device, Block, DiskErrorKind::Write)
+            Block += 1
+        }
+        else if (Written = AttemptSize) {
+            Block += AttemptSize
+            AttemptSize := Device->BatchSize
+            LastFailed := false
+        }
+        else {
+            AttemptSize := 1
+            LastFailed := true
+        }
+
+        PrintStatus(Device, Block)
+    }
+}
+
+define i64 ReadBlocks(StorageDevice* Device, i64 Block, i64 Count) {
+    FileSeek(Device->FileHandle, (Block * Device->BlockSize) As i32, SEEK_SET)
+    i64 Result := FileRead(Device->FileHandle, Device->ReadBuffer, (Count * Device->BlockSize) As i32)
+
+    if (Result < 0) {
+        Result := 0
+    }
+
+    return Result / Device->BlockSize
+}
+
+define void ReadPass(StorageDevice* Device, i64 StartBlock, i64 EndBlock) {
+    PassInfo* Pass := Device->CurrentPass()
+
+    PopulateDeviceBuffers(Device, Pass->Value)
+    FileSeek(Device->FileHandle, 0, SEEK_SET)
+
+    i64 Block := StartBlock
+    i64 AttemptSize := Device->BatchSize
+    i8 LastFailed := false
+
+    while (Block != EndBlock) {
+        if (Block + AttemptSize > EndBlock) {
+            AttemptSize := EndBlock - Block
+        }
+
+        i64 Read := ReadBlocks(Device, Block, AttemptSize)
+
+        if (Read = 0 && LastFailed) {
+            RecordBlockError(Device, Block, DiskErrorKind::Read)
+            Block += 1
+        }
+        else if (Read = AttemptSize) {
+            if !(CompareMemory(Device->WriteBuffer, Device->ReadBuffer, (AttemptSize * Device->BlockSize) As i32)) {
+                for (i64 Failed := 0, Failed < AttemptSize, Failed++) {
+                    RecordBlockError(Device, Block + Failed, DiskErrorKind::Corruption)
+                }
+            }
+
+            Block += AttemptSize
+            AttemptSize := Device->BatchSize
+            LastFailed := false
+        }
+        else {
+            AttemptSize := 1
+            LastFailed := true
+        }
+
+        PrintStatus(Device, Block)
+    }
+}
+
+define void Main(i32 ArgC, i8** ArgV) {
+    StorageDevice* Device := StorageDevice:New()
+
+    Device->BlockSize := 512
+    Device->BatchSize := 8192
+
+    Device->MaxErrors := 1000
+
+    for (i32 Index := 1, Index < ArgC, Index++) {
+        i8* Argument := ArgV[Index]
+
+        if (StringEquals(Argument, "-b") || StringEquals(Argument, "--block-size")) {
+            Device->BlockSize := AToI(ArgV[++Index])
+        }
+        else if (StringEquals(Argument, "-s") || StringEquals(Argument, "--size")) {
+            Device->TotalBlocks := AToI(ArgV[++Index])
+        }
+        else if (StringEquals(Argument, "-p") || StringEquals(Argument, "--batch-size")) {
+            Device->BatchSize := AToI(ArgV[++Index])
+        }
+        else if (StringEquals(Argument, "-d") || StringEquals(Argument, "--device")) {
+            Device->FilePath := ArgV[++Index]
+            Device->FileHandle := FileOpen(Device->FilePath, FILE_READ_WRITE | O_DIRECT)
+
+            i64 OldFlags := fcntl(Device->FileHandle, F_GETFL, 0)
+            fcntl(Device->FileHandle, F_SETFL, OldFlags | O_DIRECT)
+        }
+    }
+
+    if (Device->FilePath = null) {
+        Print("No device specified")
+        return 1
+    }
+    else if (Device->TotalBlocks = 0) {
+        Print("No device size specified")
+        return 1
+    }
+
+    i32[4] DefaultPattern {0xAA, 0x55, 0xFF, 0x00}
+
+    for (i32 Index := 0, Index < 4, Index++) {
+        i32 Value := DefaultPattern[Index]
+
+        i8* PassName := FormatString("Write %x", Value)
+        PassInfo* Info := PassInfo:New(PassName, Value, &WritePass)
+        Device->AddPass(Info)
+
+        ;Device->AddPass(PassInfo:New(FormatString("Write %x", Value), Value, &WritePass))
+        Device->AddPass(PassInfo:New(FormatString("Read %x", Value), Value, &ReadPass))
+    }
+
+    Device->WriteBuffer := Alloc(Device->BatchSize * Device->BlockSize)
+    Device->ReadBuffer := Alloc(Device->BatchSize * Device->BlockSize)
+
+    timeval Now
+    GetTimeOfDay(&Now)
+    Device->StartTime := Now.Seconds
+
+    i32 Count := Device->Passes->Count()
+
+    for (i32 Index := 0, Index < Count, Index++) {
+        PassInfo* Pass := Device->Passes->At(Index)
+
+        Print("Pass %i: %s\n", Index, Pass->Name)
+    }
+
+    for (i32 Index := 0, Index < 8, Index++) {
+        Device->CurrentPassNumber := Index
+
+        PassInfo* Pass := Device->Passes->At(Index)
+
+        Print("Pass %i: %s\n", Index, Pass->Name)
+
+        Pass->DoPass(Device, 0, Device->TotalBlocks)
+        Print("\n")
+    }
+
+    /*
+    loop {
+        Sleep(1)
+        
+        timeval Now
+        GetTimeOfDay(&Now)
+
+        i64 Progress := Now.Seconds - Start
+        
+        PrintStatus(Device, Progress)
+
+        
+    }*/
+
+    Print("hello\n")
+}
