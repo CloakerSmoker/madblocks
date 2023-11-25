@@ -1,0 +1,12 @@
+
+
+i64 SYS_FCNTL := 72
+
+i32 F_GETFL := 3
+i32 F_SETFL := 4
+
+i32 O_DIRECT := 0o40000
+
+define i64 fcntl(i64 FD, i32 Command, i64 Argument) {
+    return syscall:(SYS_FCNTL, FD, Command, Argument)
+}
