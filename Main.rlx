@@ -7,9 +7,6 @@
 #Require "fcntl.rlx"
 #Require "AVXMemory.rlx"
 
-i64 CurrentBlock := 0
-i64 TotalBlocks := 0
-
 enum DiskErrorKind {
     Read,
     Write,
@@ -26,10 +23,12 @@ struct ErrorRecord {
     i64 BlockNumber
     i64[3] ErrorCounts
 
-    define void Merge(ErrorRecord* Other) {
-        this->ErrorCounts[DiskErrorKind::Read] := Other->ErrorCounts[DiskErrorKind::Read]
-        this->ErrorCounts[DiskErrorKind::Write] := Other->ErrorCounts[DiskErrorKind::Write]
-        this->ErrorCounts[DiskErrorKind::Corruption] := Other->ErrorCounts[DiskErrorKind::Corruption]
+    define i64 Count() {
+        i64 ReadErrors := this->ErrorCounts[DiskErrorKind::Read]
+        i64 WriteErrors := this->ErrorCounts[DiskErrorKind::Write]
+        i64 CorruptionErrors := this->ErrorCounts[DiskErrorKind::Corruption]
+
+        return ReadErrors + WriteErrors + CorruptionErrors
     }
 }
 
@@ -108,6 +107,40 @@ define i64 GetUnixtime() {
     return val.Seconds
 }
 
+define void DoBlockPrint(PrintOutputAdapterPrototype* this, i8* Format, i32* FormatIndex, void* Parameters, i32 ParameterCount, i32* ParameterIndex) {
+	i64 Block := Parameters[*ParameterIndex] As i64
+	
+	i8[100] Buffer
+	
+    for (i32 Index := 0, Block != 0, Index += 1) {
+        if (Index % 4 = 3) {
+            Buffer[Index] := ','
+        }
+        else {
+            Buffer[Index] := NumberToCharacter((Block % 10) As i8)
+            Block /= 10
+        }
+    }
+
+    if (Index = 0) {
+		Buffer[0] := '0'
+		Index := 1
+	}
+
+    MemoryReverse(Buffer, Index)
+
+    this->DoPrintCharacters(Buffer, Index)
+	
+	*ParameterIndex += 1
+}
+
+PrintFormatPrototype BlockFormatPrototype {
+	Name: "block",
+	Format: &DoBlockPrint
+}
+
+i32 BLOCK_FORMAT_PROTOTYPE_ID := AddPrintFormat(&BlockFormatPrototype)
+
 i64 LastStatusHash := 0
 
 define void PrintStatus(StorageDevice* Device, i64 Block) {
@@ -155,7 +188,8 @@ define void PrintStatus(StorageDevice* Device, i64 Block) {
     i64 WriteErrors := Device->GlobalErrors->ErrorCounts[DiskErrorKind::Write]
     i64 CorruptionErrors := Device->GlobalErrors->ErrorCounts[DiskErrorKind::Corruption]
 
-    Print(", %i errored blocks, %ir/%iw/%ic errors (%i)", Device->ErrorRecords->Count(), ReadErrors, WriteErrors, CorruptionErrors, Block)
+    Print(", %i errored blocks, %ir/%iw/%ic errors", Device->ErrorRecords->Count(), ReadErrors, WriteErrors, CorruptionErrors)
+    Print(" [--resume %i %block]", Device->CurrentPassNumber, Block)
 }
 
 define void RecordBlockError(StorageDevice* Device, i64 Block, DiskErrorKind Kind) {
@@ -177,9 +211,22 @@ define void RecordBlockError(StorageDevice* Device, i64 Block, DiskErrorKind Kin
 
     i8* KindName := GetDiskErrorKindName(Kind)
 
-    Print("%s: %s: %s error on block %i (%x)\n", Device->FilePath, Device->CurrentPass()->Name, KindName, Block, Block)
+    i8[300] ErrorBuffer
+    i32 Length := FormatString(ErrorBuffer, 300, "%s: %s: %s error on block %i (%block)\n", Device->FilePath, Device->CurrentPass()->Name, KindName, Block, Block)
+    ErrorBuffer[Length] := 0
+
+    Print("%s", ErrorBuffer)
+
+    if (Device->OutputHandle != 0) {
+        FileWrite(Device->OutputHandle, ErrorBuffer, Length)
+    }
 
     Device->GlobalErrors->ErrorCounts[Kind] += 1
+
+    if (Device->GlobalErrors->Count() >= Device->MaxErrors) {
+        Print("Max error threshold reached")
+        Exit(1)
+    }
 }
 
 define void PopulateDeviceBuffers(StorageDevice* Device, i32 Value) {
@@ -281,6 +328,39 @@ define void ReadPass(StorageDevice* Device, PassInfo* Pass) {
     }
 }
 
+define i64 BlockAToI(i8* String, i32 Length, i64 Base) {
+	i64 Result := 0
+	i64 Sign := 1
+	i32 Start := 0
+	
+	if !(IsNumeric(String[Start], Base)) {
+		return 0
+	}
+		
+	for (i32 Index := Start, Index < Length, Index += 1) {
+		i8 NextCharacter := String[Index]
+
+        if (NextCharacter = ',') {
+            continue
+        }
+		
+		if !(IsNumeric(NextCharacter, Base)) {
+			Break
+		}
+		
+		Result *= Base
+		Result += GetCharacterValue(NextCharacter)
+	}
+	
+	return Result * Sign
+}
+define i64 BlockAToI(i8* String, i64 Base) {
+	return BlockAToI(String, StringLength(String), Base)
+}
+define i64 BlockAToI(i8* String) {
+	return BlockAToI(String, StringLength(String), 10)
+}
+
 define void Main(i32 ArgC, i8** ArgV) {
     StorageDevice* Device := StorageDevice:New()
 
@@ -296,12 +376,8 @@ define void Main(i32 ArgC, i8** ArgV) {
     for (i32 Index := 0, Index < 4, Index++) {
         i32 Value := DefaultPattern[Index]
 
-        i8* PassName := FormatString("Write %x", Value)
-        PassInfo* Info := PassInfo:New(PassName, Value, &WritePass)
-        Device->AddPass(Info)
-
-        ;Device->AddPass(PassInfo:New(FormatString("Write %x", Value), Value, &WritePass))
-        Device->AddPass(PassInfo:New(FormatString("Read %x", Value), Value, &ReadPass))
+        Device->AddPass(PassInfo:New(FormatString("Write %B", Value), Value, &WritePass))
+        Device->AddPass(PassInfo:New(FormatString("Read  %B", Value), Value, &ReadPass))
     }
 
     for (i32 Index := 1, Index < ArgC, Index++) {
@@ -311,16 +387,19 @@ define void Main(i32 ArgC, i8** ArgV) {
             Device->BlockSize := AToI(ArgV[++Index])
         }
         else if (StringEquals(Argument, "-s") || StringEquals(Argument, "--size")) {
-            Device->TotalBlocks := AToI(ArgV[++Index])
+            Device->TotalBlocks := BlockAToI(ArgV[++Index])
         }
         else if (StringEquals(Argument, "-p") || StringEquals(Argument, "--batch-size")) {
-            Device->BatchSize := AToI(ArgV[++Index])
+            Device->BatchSize := BlockAToI(ArgV[++Index])
+        }
+        else if (StringEquals(Argument, "-e") || StringEquals(Argument, "--max-errors")) {
+            Device->MaxErrors := BlockAToI(ArgV[++Index])
         }
         else if (StringEquals(Argument, "-r") || StringEquals(Argument, "--resume")) {
             FirstPass := AToI(ArgV[++Index]) As i32
 
             PassInfo* FirstPassInfo := Device->Passes->At(FirstPass)
-            FirstPassInfo->StartBlock := AToI(ArgV[++Index])
+            FirstPassInfo->StartBlock := BlockAToI(ArgV[++Index])
         }
         else if (StringEquals(Argument, "-d") || StringEquals(Argument, "--device")) {
             Device->FilePath := ArgV[++Index]
@@ -328,6 +407,11 @@ define void Main(i32 ArgC, i8** ArgV) {
 
             i64 OldFlags := fcntl(Device->FileHandle, F_GETFL, 0)
             fcntl(Device->FileHandle, F_SETFL, OldFlags | O_DIRECT)
+        }
+        else if (StringEquals(Argument, "-o") || StringEquals(Argument, "--output-file")) {
+            Device->OutputHandle := FileOpen(ArgV[++Index], FILE_READ_WRITE | FILE_CREATE_NEW)
+
+            FileSeek(Device->OutputHandle, 0, SEEK_END)
         }
     }
 
@@ -348,9 +432,9 @@ define void Main(i32 ArgC, i8** ArgV) {
     Device->StartTime := Now.Seconds
 
     Print("Device: %s\n", Device->FilePath)
-    Print("Total Blocks: %i\n", Device->TotalBlocks)
+    Print("Total Blocks: %block\n", Device->TotalBlocks)
     Print("Total Bytes: %i\n", Device->TotalBlocks * Device->BlockSize)
-    Print("Testing %i blocks at a time\n", Device->BatchSize)
+    Print("Testing %block blocks at a time\n", Device->BatchSize)
     Print("Pass Summary:\n")
 
     i32 Count := Device->Passes->Count()
@@ -362,7 +446,7 @@ define void Main(i32 ArgC, i8** ArgV) {
             Pass->EndBlock := Device->TotalBlocks
         }
 
-        Print("  Pass %i: %s (%i - %i)\n", Index, Pass->Name, Pass->StartBlock, Pass->EndBlock)
+        Print("  Pass %i: %s (%block - %block)\n", Index, Pass->Name, Pass->StartBlock, Pass->EndBlock)
     }
 
     for (i32 Index := FirstPass, Index < 8, Index++) {
@@ -370,7 +454,7 @@ define void Main(i32 ArgC, i8** ArgV) {
 
         PassInfo* Pass := Device->Passes->At(Index)
 
-        Print("Starting Pass %i: %s (%i - %i)\n", Index, Pass->Name, Pass->StartBlock, Pass->EndBlock)
+        Print("Starting Pass %i: %s (%block - %block)\n", Index, Pass->Name, Pass->StartBlock, Pass->EndBlock)
 
         Pass->DoPass(Device, Pass)
         Print("\n")
