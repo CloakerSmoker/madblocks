@@ -5,7 +5,9 @@
 
 #Require "Time.rlx"
 #Require "fcntl.rlx"
+
 #Require "AVXMemory.rlx"
+#Require "SSE4Memory.rlx"
 
 enum DiskErrorKind {
     Read,
@@ -289,6 +291,8 @@ define i64 ReadBlocks(StorageDevice* Device, i64 Block, i64 Count) {
     return Result / Device->BlockSize
 }
 
+i8(i32, void*, i32) FAST_COMPARE_MEMORY := &SSE4CompareMemory
+
 define void ReadPass(StorageDevice* Device, PassInfo* Pass) {
     PopulateDeviceBuffers(Device, Pass->Value)
     FileSeek(Device->FileHandle, 0, SEEK_SET)
@@ -309,7 +313,7 @@ define void ReadPass(StorageDevice* Device, PassInfo* Pass) {
             Block += 1
         }
         else if (Read = AttemptSize) {
-            if !(AVXCompareMemory(Pass->Value, Device->ReadBuffer, (AttemptSize * Device->BlockSize) As i32)) {
+            if !(FAST_COMPARE_MEMORY(Pass->Value, Device->ReadBuffer, (AttemptSize * Device->BlockSize) As i32)) {
                 for (i64 Failed := 0, Failed < AttemptSize, Failed++) {
                     RecordBlockError(Device, Block + Failed, DiskErrorKind::Corruption)
                 }
@@ -362,6 +366,12 @@ define i64 BlockAToI(i8* String) {
 }
 
 define void Main(i32 ArgC, i8** ArgV) {
+    if (IsAVXSupported()) {
+        Print("AVX support detected, using 256 bit comparisons")
+
+        FAST_COMPARE_MEMORY := &AVXCompareMemory
+    }
+
     StorageDevice* Device := StorageDevice:New()
 
     Device->BlockSize := 512

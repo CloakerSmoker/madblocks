@@ -1,6 +1,6 @@
 
 RLX=compiler/build/linux_compiler.elf
-RLX_FLAGS?=--linux --debug --dwarf
+RLX_FLAGS?=--linux
 DBG?=
 
 BUILD=./build
